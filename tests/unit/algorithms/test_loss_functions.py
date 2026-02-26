@@ -23,9 +23,14 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    _distributed_token_accuracy,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
+    allgather_cp_sharded_tensor,
+)
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
@@ -2050,3 +2055,166 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+# ---------------------------------------------------------------------------
+# Token Accuracy Tests
+# ---------------------------------------------------------------------------
+
+
+def _build_token_accuracy_data(device="cuda"):
+    """Build test data for token accuracy: vocab=8, batch=1, seq_len=6.
+
+    input_ids=[0,1,2,3,4,5], token_mask=[0,0,1,1,1,1], sample_mask=[1].
+    After shift, targets=[1,2,3,4,5]; after mask slice, 4 unmasked positions.
+
+    Returns (logits, data, expected_correct=3, expected_unmasked=4).
+    """
+    logits = torch.tensor([[
+        [ 1.2,  5.8, -0.3,  0.7, -1.5,  0.2, -0.8,  0.4],  # argmax=1=target MASKED
+        [-1.1,  2.3,  4.1,  3.5, -0.2,  0.8, -1.7,  1.0],  # argmax=2=target CORRECT
+        [ 0.5, -0.4,  1.8,  2.1, -1.3,  0.9,  3.7, -0.6],  # argmax=6!=3     WRONG
+        [-2.0,  0.3, -0.5,  1.4,  6.2,  2.8,  0.1, -1.1],  # argmax=4=target CORRECT
+        [ 0.8, -0.9,  1.5,  3.9,  2.1,  4.6, -0.3,  0.7],  # argmax=5=target CORRECT
+        [ 0.1, -0.2,  0.3, -0.1,  0.0,  0.2, -0.4,  0.1],  # unused
+    ]], dtype=torch.float32, device=device)
+    data = BatchedDataDict({
+        "input_ids": torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.long, device=device),
+        "token_mask": torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.float32, device=device),
+        "sample_mask": torch.tensor([1], dtype=torch.float32, device=device),
+    })
+    return logits, data, 3, 4
+
+
+def _run_nll_loss(logits, data, **kwargs):
+    """Run NLLLoss and return metrics dict."""
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    _, metrics = NLLLoss()(
+        logits, data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=mask.sum(),
+        **kwargs,
+    )
+    return metrics
+
+
+# logit_tweaks: dict of {(batch, pos, vocab_idx): value} overrides applied to base logits.
+# "all_correct" boosts pos2 target logit past competitor; "all_wrong" makes non-targets win.
+@pytest.mark.parametrize("logit_tweaks,expected_correct,dpo", [
+    ({}, 3, False),
+    ({(0, 2, 3): 4.2}, 4, False),
+    ({(0,1,3): 4.5, (0,1,2): 3.0, (0,3,5): 6.5, (0,3,4): 5.0, (0,4,3): 5.0, (0,4,5): 4.0}, 0, False),
+    ({}, None, True),
+], ids=["partial_correct", "all_correct", "all_wrong", "dpo_mode"])
+def test_nll_loss_token_accuracy(logit_tweaks, expected_correct, dpo):
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    logits, data, _, expected_unmasked = _build_token_accuracy_data()
+    for idx, val in logit_tweaks.items():
+        logits[idx] = val
+    metrics = _run_nll_loss(logits, data, dpo_loss=dpo)
+    if dpo:
+        assert "num_correct_tokens" not in metrics
+    else:
+        assert metrics["num_correct_tokens"] == expected_correct
+        assert metrics["num_unmasked_tokens"] == expected_unmasked
+
+
+def test_nll_loss_token_accuracy_multi_sample():
+    """Batch=2, vocab=4: sample 0 active (2/3 correct), sample 1 zeroed by sample_mask.
+
+    Sample 0 (after shift): pos0 argmax=1=target, pos1 argmax=2=target, pos2 argmax=0!=3.
+    Sample 1 has sample_mask=0 so all tokens are excluded from the count.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    device = "cuda"
+    logits = torch.tensor([
+        [[1.0, 3.5, 0.5, 0.2], [0.1, 0.2, 2.8, 1.5], [3.0, 0.1, 0.2, 1.5], [0.0, 0.0, 0.0, 0.0]],
+        [[5.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+    ], dtype=torch.float32, device=device)
+    data = BatchedDataDict({
+        "input_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long, device=device),
+        "token_mask": torch.tensor([[0, 1, 1, 1], [0, 1, 1, 1]], dtype=torch.float32, device=device),
+        "sample_mask": torch.tensor([1, 0], dtype=torch.float32, device=device),
+    })
+    metrics = _run_nll_loss(logits, data)
+    assert metrics["num_correct_tokens"] == 2
+    assert metrics["num_unmasked_tokens"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Distributed token accuracy tests
+# ---------------------------------------------------------------------------
+
+
+def _run_distributed_token_accuracy_tp2(rank, world_size):
+    """Test _distributed_token_accuracy directly with TP=2 (vocab split in half per rank)."""
+    device = f"cuda:{rank}"
+    torch.cuda.set_device(device)
+    full_logits, _, _, _ = _build_token_accuracy_data(device=device)
+    shard = full_logits.shape[-1] // 2
+    local_logits = full_logits[:, :, rank * shard : (rank + 1) * shard]
+    targets = torch.tensor([[1, 2, 3, 4, 5, 0]], dtype=torch.long, device=device)
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    correct = _distributed_token_accuracy(local_logits, targets, rank, tp_group)
+    expected = torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]], device=device)
+    torch.testing.assert_close(correct[:, :5], expected, atol=1e-6, rtol=0)
+
+
+def test_distributed_token_accuracy_tp2(distributed_test_runner):
+    distributed_test_runner(_run_distributed_token_accuracy_tp2, world_size=2)
+
+
+def _run_megatron_accuracy_test(rank, world_size, tp_size, cp_size):
+    """End-to-end NLLLoss token accuracy for any Megatron TP/CP combination.
+
+    Rank layout: tp_rank = rank % tp_size, cp_rank = rank // tp_size.
+    Logits are CP-sharded along the sequence dim, then TP-sharded along vocab dim.
+    All ranks participate in every new_group call (required by torch.distributed).
+    """
+    device = f"cuda:{rank}"
+    torch.cuda.set_device(device)
+    full_logits, data, expected_correct, expected_unmasked = _build_token_accuracy_data(device=device)
+    tp_rank, cp_rank = rank % tp_size, rank // tp_size
+
+    # Pad sequence for CP divisibility, then shard by CP and TP
+    if cp_size > 1:
+        full_logits = torch.nn.functional.pad(full_logits, (0, 0, 0, 2), value=0.0)
+    local_logits = _get_tokens_on_this_cp_rank(full_logits, cp_rank, cp_size, seq_dim=1)
+    shard = local_logits.shape[-1] // tp_size
+    local_logits = local_logits[:, :, tp_rank * shard : (tp_rank + 1) * shard]
+
+    # Create TP groups (one per CP rank), then CP groups (one per TP rank)
+    tp_group = None
+    for cp_r in range(cp_size):
+        ranks = [cp_r * tp_size + t for t in range(tp_size)]
+        g = torch.distributed.new_group(ranks=ranks)
+        if rank in ranks:
+            tp_group = g
+    cp_group = None
+    if cp_size > 1:
+        for tp_r in range(tp_size):
+            ranks = [c * tp_size + tp_r for c in range(cp_size)]
+            g = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                cp_group = g
+
+    metrics = _run_nll_loss(
+        local_logits, data,
+        vocab_parallel_rank=tp_rank, vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+    )
+    assert metrics["num_correct_tokens"] == expected_correct
+    assert metrics["num_unmasked_tokens"] == expected_unmasked
+
+
+@pytest.mark.parametrize("tp_size,cp_size,world_size", [
+    (2, 1, 2), (1, 2, 2), (2, 2, 4),
+], ids=["tp2", "cp2", "tp2_cp2"])
+def test_nll_loss_token_accuracy_megatron(distributed_test_runner, tp_size, cp_size, world_size):
+    from functools import partial
+    distributed_test_runner(
+        partial(_run_megatron_accuracy_test, tp_size=tp_size, cp_size=cp_size),
+        world_size=world_size,
+    )

@@ -262,6 +262,8 @@ def validate(
 
         val_metrics = {"val_loss": 0.0}
         sum_num_valid_tokens = 0
+        sum_num_correct_tokens = 0.0
+        sum_num_unmasked_tokens = 0.0
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
@@ -317,11 +319,21 @@ def validate(
                 val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
                 sum_num_valid_tokens += num_valid_tokens
 
+                mb_metrics = val_results["all_mb_metrics"]
+                if "num_correct_tokens" in mb_metrics:
+                    sum_num_correct_tokens += sum(mb_metrics["num_correct_tokens"])
+                if "num_unmasked_tokens" in mb_metrics:
+                    sum_num_unmasked_tokens += sum(mb_metrics["num_unmasked_tokens"])
+
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
         if sum_num_valid_tokens > 0:
             val_metrics["val_loss"] /= sum_num_valid_tokens
+            if sum_num_unmasked_tokens > 0:
+                val_metrics["val_token_accuracy"] = (
+                    sum_num_correct_tokens / sum_num_unmasked_tokens
+                )
         else:
             warnings.warn(
                 "No validation metrics were collected."
@@ -339,6 +351,8 @@ def validate(
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
+        if "val_token_accuracy" in val_metrics:
+            print(f"    • Token accuracy: {val_metrics['val_token_accuracy']:.4f}")
 
         # Print timing information
         print("\n  ⏱️  Validation Timing:")
@@ -506,6 +520,11 @@ def sft_train(
                         metrics[k] = np.sum(v).item()
                 total_valid_tokens += metrics.get("global_valid_toks", 0)
 
+                if "num_correct_tokens" in metrics and "num_unmasked_tokens" in metrics:
+                    metrics["token_accuracy"] = metrics["num_correct_tokens"] / max(
+                        metrics["num_unmasked_tokens"], 1
+                    )
+
                 ## Checkpointing
                 sft_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
@@ -585,6 +604,8 @@ def sft_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            if "token_accuracy" in metrics:
+                print(f"  • Token accuracy: {metrics['token_accuracy']:.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]

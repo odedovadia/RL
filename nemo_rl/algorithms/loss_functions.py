@@ -599,6 +599,113 @@ class ClippedPGLossFn(LossFunction):
         )
 
 
+@torch.no_grad()
+def _distributed_token_accuracy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    vocab_parallel_rank: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Per-position correctness for TP-sharded logits via max-comparison.
+
+    Returns [B, S] float: 1.0 where argmax(global logits) == target, else 0.0.
+    """
+    V_local = logits.shape[-1]
+    vocab_start = vocab_parallel_rank * V_local
+    targets = targets.to(logits.device)
+
+    global_max = logits.max(dim=-1).values
+    torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=vocab_parallel_group)
+
+    in_shard = (targets >= vocab_start) & (targets < vocab_start + V_local)
+    local_idx = (targets - vocab_start).clamp(0, V_local - 1)
+    target_logit = logits.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
+    target_logit = torch.where(in_shard, target_logit, float("-inf"))
+    torch.distributed.all_reduce(target_logit, op=torch.distributed.ReduceOp.MAX, group=vocab_parallel_group)
+
+    return (target_logit >= global_max - 1e-5).float()
+
+
+def _megatron_token_correct(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    vocab_parallel_rank: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Per-position correctness for Megatron TP (+ optional CP). Returns [B, S] float."""
+    cp_size = 1 if context_parallel_group is None else torch.distributed.get_world_size(context_parallel_group)
+    cp_rank = 0 if context_parallel_group is None else torch.distributed.get_rank(context_parallel_group)
+    targets = input_ids.roll(shifts=-1, dims=-1)
+    pad_len = logits.shape[1] * cp_size - targets.shape[1]
+    if pad_len > 0:
+        targets = torch.nn.functional.pad(targets, (0, pad_len), value=0)
+    targets = _get_tokens_on_this_cp_rank(targets, cp_rank, cp_size, seq_dim=1)
+    correct = _distributed_token_accuracy(logits, targets, vocab_parallel_rank, vocab_parallel_group)
+    if cp_size > 1:
+        correct = allgather_cp_sharded_tensor(correct, context_parallel_group, seq_dim=1)
+        if pad_len > 0:
+            correct = correct[:, :-pad_len]
+    return correct
+
+
+def _dtensor_token_correct(
+    logits: torch.distributed.tensor.DTensor,
+    input_ids: torch.Tensor | torch.distributed.tensor.DTensor,
+    seq_index: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Per-position correctness for DTensor TP (+ optional CP via seq_index). Returns [B, S] float."""
+    mesh = logits.device_mesh
+    tp_group = mesh.get_group("tp")
+    local_logits = logits.to_local()
+    if seq_index is not None:
+        _, sorted_idx = torch.sort(seq_index)
+        ids_full = input_ids.full_tensor() if isinstance(input_ids, torch.distributed.tensor.DTensor) else input_ids
+        targets_local = torch.distributed.tensor.distribute_tensor(
+            ids_full[:, sorted_idx].roll(shifts=-1, dims=-1)[:, seq_index],
+            mesh, logits.placements,
+        ).to_local()
+    else:
+        ids = input_ids.roll(shifts=-1, dims=-1)
+        targets_local = ids.to_local() if isinstance(ids, torch.distributed.tensor.DTensor) else ids
+    correct = _distributed_token_accuracy(local_logits, targets_local, tp_group.rank(), tp_group)
+    if seq_index is not None:
+        correct = torch.distributed.tensor.DTensor.from_local(
+            correct, mesh, logits.placements,
+        ).full_tensor()[:, sorted_idx]
+    return correct
+
+
+def _local_token_correct(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """Per-position correctness for non-distributed logits. Returns [B, S] float."""
+    predicted = logits.argmax(dim=-1)
+    return (predicted == input_ids.roll(shifts=-1, dims=-1).to(predicted.device)).float()
+
+
+@torch.no_grad()
+def _compute_num_correct_tokens(
+    next_token_logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    mask: torch.Tensor,
+    vocab_parallel_rank: Optional[int],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> float:
+    """Count correctly predicted tokens across all distributed configurations."""
+    if vocab_parallel_group is not None:
+        correct = _megatron_token_correct(
+            next_token_logits, data["input_ids"],
+            vocab_parallel_rank, vocab_parallel_group, context_parallel_group,
+        )
+    elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        correct = _dtensor_token_correct(
+            next_token_logits, data["input_ids"], data.get("seq_index", None),
+        )
+    else:
+        correct = _local_token_correct(next_token_logits, data["input_ids"])
+    return (correct[:, :-1][:, : mask.shape[1]] * mask).sum().item()
+
+
 class NLLLoss(LossFunction):
     """Negative Log Likelihood Loss function."""
 
@@ -655,6 +762,13 @@ class NLLLoss(LossFunction):
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
 
+        num_correct_tokens = 0.0
+        if not dpo_loss:
+            num_correct_tokens = _compute_num_correct_tokens(
+                next_token_logits, data, mask,
+                vocab_parallel_rank, vocab_parallel_group, context_parallel_group,
+            )
+
         if dpo_loss:
             ## shape: [batch_size]
             num_unmasked_tokens = torch.sum(mask, -1)
@@ -671,11 +785,15 @@ class NLLLoss(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        return loss, {
+        metrics = {
             "loss": loss.item() if loss.ndim == 0 else loss,
             "num_unmasked_tokens": mask.sum().item(),
             "num_valid_samples": sample_mask.sum().item(),
         }
+        if not dpo_loss:
+            metrics["num_correct_tokens"] = num_correct_tokens
+
+        return loss, metrics
 
 
 class PreferenceLossDataDict(TypedDict):
