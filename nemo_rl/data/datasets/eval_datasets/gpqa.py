@@ -24,6 +24,13 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class GPQADataset:
+    DEFAULT_PROMPT = (
+        "Answer the following multiple choice question. The last line of your response "
+        "should be of the following format: 'Answer: $LETTER' (without quotes) where "
+        "LETTER is one of ABCD. Think step by step before answering.\n"
+    )
+    DEFAULT_VERIFIER_TYPE = "multilingual_multichoice"
+
     def __init__(
         self,
         variant: Literal["diamond", "main"] = "diamond",
@@ -38,6 +45,8 @@ class GPQADataset:
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
+        if self.task_spec.prompt is None:
+            self.task_spec.prompt = self.DEFAULT_PROMPT
         self.processor = processors.multichoice_qa_processor
 
     def _rekey(self, data: dict[str, Any]):

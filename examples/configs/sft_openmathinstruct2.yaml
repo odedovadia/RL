@@ -78,6 +78,7 @@ data:
   # dataset
   train:
     dataset_name: OpenMathInstruct-2
+    processor: sft_processor
     output_key: generated_solution
     split: train_1M
     split_validation_size: 0.05 # use 5% of the training data as validation data

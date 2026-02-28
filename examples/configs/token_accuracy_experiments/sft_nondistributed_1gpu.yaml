@@ -1,0 +1,13 @@
+defaults: base_qwen1b_squad.yaml
+
+policy:
+  make_sequence_length_divisible_by: 1
+
+logger:
+  wandb:
+    name: "sft-qwen1b-squad-nondist-1gpu"
+  tensorboard:
+    log_dir: "tb_logs-token-accuracy-nondist-1gpu"
+
+cluster:
+  gpus_per_node: 1

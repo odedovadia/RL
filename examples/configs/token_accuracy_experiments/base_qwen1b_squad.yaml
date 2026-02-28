@@ -1,0 +1,26 @@
+defaults: ../sft.yaml
+
+sft:
+  max_num_steps: 200
+  val_period: 50
+  val_batches: 8
+  val_at_start: true
+  val_at_end: true
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: default
+  train_global_batch_size: 32
+  train_micro_batch_size: 2
+  max_total_sequence_length: 1024
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: "token-accuracy-experiments"

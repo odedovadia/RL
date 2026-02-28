@@ -16,6 +16,7 @@ import os
 import time
 import warnings
 from typing import Any, Optional, TypeVar
+from datetime import timedelta
 
 import torch
 from megatron.bridge import AutoBridge
@@ -185,7 +186,7 @@ def setup_distributed() -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=15))
 
 
 def validate_and_set_config(
@@ -405,6 +406,12 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    if "moe_router_topk" in config["megatron_cfg"]:
+        model_cfg.moe_router_topk = config["megatron_cfg"]["moe_router_topk"]
+
+    if "moe_aux_loss_coeff" in config["megatron_cfg"]:
+        model_cfg.moe_aux_loss_coeff = config["megatron_cfg"]["moe_aux_loss_coeff"]
+
 
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
@@ -528,14 +535,14 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     model_cfg.calculate_per_token_loss = True
     model_cfg.perform_initialization = True
 
-    # MoE aux loss validation
-    assert (
-        "aux_loss" not in model_cfg.moe_router_load_balancing_type
-        or model_cfg.moe_aux_loss_coeff == 0
-    ), (
-        "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-        "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-    )
+    # # MoE aux loss validation
+    # assert (
+    #     "aux_loss" not in model_cfg.moe_router_load_balancing_type
+    #     or model_cfg.moe_aux_loss_coeff == 0
+    # ), (
+    #     "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
+    #     "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
+    # )
 
 
 def _validate_dtype_config(
@@ -579,6 +586,16 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    opt_cfg = dict(config["megatron_cfg"]["optimizer"])
+    for k, v in opt_cfg.items():
+        if isinstance(v, str) and v in dtype_map:
+            opt_cfg[k] = dtype_map[v]
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -588,7 +605,7 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
+        optimizer=OptimizerConfig(**opt_cfg),
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][

@@ -16,6 +16,7 @@ import argparse
 import os
 import pprint
 from functools import partial
+from typing import Any
 
 from datasets import concatenate_datasets
 from omegaconf import OmegaConf
@@ -43,6 +44,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run SFT training with configuration")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
+    )
+    parser.add_argument(
+        "--print-samples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a few processed training samples before training starts (default: enabled)",
+    )
+    parser.add_argument(
+        "--print-samples-n",
+        type=int,
+        default=10,
+        help="Number of processed samples to preview when --print-samples is set",
     )
 
     # Parse known args for the script
@@ -146,6 +159,76 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     return dataset, val_dataset
 
 
+def preview_processed_samples(
+    dataset: AllTaskProcessedDataset,
+    tokenizer_or_processor: Any,
+    num_samples: int = 2,
+    max_chars: int = 8192,
+) -> None:
+    """Print a concise preview of post-template processed samples."""
+    if num_samples <= 0:
+        return
+    if len(dataset) == 0:
+        print("\n⚠️ Sample preview requested, but dataset is empty.")
+        return
+
+    decode_tokenizer = (
+        tokenizer_or_processor.tokenizer
+        if hasattr(tokenizer_or_processor, "tokenizer")
+        else tokenizer_or_processor
+    )
+    num_to_show = min(num_samples, len(dataset))
+
+    print("\n" + "=" * 80)
+    print(f"SAMPLE PREVIEW: showing {num_to_show} processed training sample(s)")
+    print("=" * 80)
+
+    for i in range(num_to_show):
+        sample = dataset[i]
+        message_log = sample.get("message_log", [])
+        print(
+            f"\n[Sample {i}] idx={sample.get('idx')} length={sample.get('length')} "
+            f"loss_multiplier={sample.get('loss_multiplier')}"
+        )
+
+        for turn_idx, msg in enumerate(message_log):
+            role = msg.get("role", "unknown")
+            token_ids = msg.get("token_ids", [])
+            token_count = len(token_ids) if hasattr(token_ids, "__len__") else 0
+
+            # Prefer content because it's already post-template text for this turn.
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                decoded = content
+            elif isinstance(content, list):
+                text_parts = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                decoded = "\n".join([part for part in text_parts if part]) or "<no text content>"
+            else:
+                decoded = "<decode unavailable>"
+                if hasattr(decode_tokenizer, "decode"):
+                    try:
+                        ids = (
+                            token_ids.tolist()
+                            if hasattr(token_ids, "tolist")
+                            else token_ids
+                        )
+                        decoded = decode_tokenizer.decode(ids, skip_special_tokens=False)
+                    except Exception as exc:
+                        decoded = f"<decode failed: {exc}>"
+
+            if len(decoded) > max_chars:
+                decoded = decoded[:max_chars] + "... [truncated]"
+
+            print(f"  - Turn {turn_idx} role={role} tokens={token_count}")
+            print(f"    {decoded}")
+
+    print("=" * 80 + "\n")
+
+
 def main(is_vlm: bool = False):
     """Main entry point."""
     # Parse arguments
@@ -183,6 +266,8 @@ def main(is_vlm: bool = False):
 
     # setup data
     dataset, val_dataset = setup_data(tokenizer, config["data"])
+    if args.print_samples:
+        preview_processed_samples(dataset, tokenizer, num_samples=args.print_samples_n)
 
     (
         policy,

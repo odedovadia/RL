@@ -274,7 +274,9 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(
+    vllm_generation, dataloader, env, master_config, shutdown_generation=True
+):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
@@ -284,24 +286,41 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        shutdown_generation: If True, shut down the generation server after eval.
+            Set to False when running multiple evaluations with the same server.
     """
     # Check if async engine is enabled and run appropriate version
     if master_config["generation"]["vllm_cfg"]["async_engine"]:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
+                vllm_generation,
+                dataloader,
+                env,
+                master_config,
+                use_async=True,
+                shutdown_generation=shutdown_generation,
             )
         )
     else:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
+                vllm_generation,
+                dataloader,
+                env,
+                master_config,
+                use_async=False,
+                shutdown_generation=shutdown_generation,
             )
         )
 
 
 async def _run_env_eval_impl(
-    vllm_generation, dataloader, env, master_config, use_async=False
+    vllm_generation,
+    dataloader,
+    env,
+    master_config,
+    use_async=False,
+    shutdown_generation=True,
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
@@ -384,19 +403,24 @@ async def _run_env_eval_impl(
 
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
-    vllm_generation.shutdown()
+    if shutdown_generation:
+        vllm_generation.shutdown()
+
+    dataset_size = len(dataloader.dataset)
 
     # Save evaluation data to JSON file if save_path is specified
     save_path = eval_config.get("save_path")
     if evaluation_data and save_path is not None:
-        _save_evaluation_data_to_json(evaluation_data, master_config, save_path)
+        _save_evaluation_data_to_json(
+            evaluation_data, master_config, save_path, score, dataset_size
+        )
 
     # Print results
     _print_results(
         master_config,
         generation_config,
         score,
-        len(dataloader.dataset),
+        dataset_size,
         metric,
         k_value,
         num_tests_per_prompt,
@@ -419,7 +443,9 @@ async def _generate_texts(vllm_generation, inputs, use_async):
         return vllm_generation.generate_text(inputs)["texts"]
 
 
-def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
+def _save_evaluation_data_to_json(
+    evaluation_data, master_config, save_path, score, dataset_size
+):
     """Save evaluation data to a JSON file.
 
     Args:
@@ -427,6 +453,8 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
         master_config: Configuration dictionary
         save_path: Path to save evaluation results. Set to null to disable saving.
                   Example: "results/eval_output" or "/path/to/evaluation_results"
+        score: Raw cumulative score across all prompts
+        dataset_size: Total number of prompts evaluated
     """
     # Extract configuration information
     config_data = {
@@ -448,6 +476,20 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     # Generate file paths within the directory
     eval_data_path = os.path.join(save_dir, "evaluation_data.json")
     config_path = os.path.join(save_dir, "config.json")
+    results_path = os.path.join(save_dir, "results.json")
+
+    # Save results summary
+    results_data = {
+        "score": score,
+        "average_score": score / dataset_size if dataset_size > 0 else 0.0,
+        "dataset_size": dataset_size,
+        "metric": master_config["eval"]["metric"],
+        "k_value": master_config["eval"]["k_value"],
+        "num_tests_per_prompt": master_config["eval"]["num_tests_per_prompt"],
+    }
+    with open(results_path, "w") as f:
+        json.dump(results_data, f, indent=2)
+    print(f"\n✓ Results saved to: {results_path}")
 
     # Prepare the data to save
     data_to_save = {"evaluation_data": evaluation_data}

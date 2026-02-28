@@ -171,6 +171,8 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    moe_router_topk: NotRequired[int]
+    moe_aux_loss_coeff: NotRequired[float]
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.

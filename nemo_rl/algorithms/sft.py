@@ -586,9 +586,10 @@ def sft_train(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
                             ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "policy", "optimizer"
-                            ),
+                            optimizer_path=None,
+                            # optimizer_path=os.path.join(
+                            #     checkpoint_path, "policy", "optimizer"
+                            # ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

@@ -23,6 +23,12 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class MathDataset:
+    DEFAULT_PROMPT = (
+        "Solve the following math problem. Make sure to put the answer "
+        "(and only answer) inside \\boxed{{}}.\n\n{}\n"
+    )
+    DEFAULT_VERIFIER_TYPE = "math"
+
     def __init__(
         self,
         variant: Literal["math_test", "math_500_test"] = "math_test",
@@ -40,6 +46,8 @@ class MathDataset:
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
+        if self.task_spec.prompt is None:
+            self.task_spec.prompt = self.DEFAULT_PROMPT
         self.processor = processors.math_data_processor
 
     def _rekey(self, data: dict[str, Any]):

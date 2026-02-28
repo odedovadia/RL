@@ -1,0 +1,21 @@
+defaults: base_qwen1b_squad.yaml
+
+policy:
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  make_sequence_length_divisible_by: 4
+  megatron_cfg:
+    enabled: true
+    converter_type: "Qwen2ForCausalLM"
+    tensor_model_parallel_size: 1
+    context_parallel_size: 2
+
+logger:
+  wandb:
+    name: "sft-qwen1b-squad-megatron-cp2-8gpu"
+  tensorboard:
+    log_dir: "tb_logs-token-accuracy-megatron-cp2-8gpu"
+
+cluster:
+  gpus_per_node: 8
