@@ -1,0 +1,32 @@
+# SFT with Dolci-Instruct-SFT dataset on Megatron 30B
+defaults: sft_openmathinstruct2_megatron_30b.yaml
+
+checkpointing:
+  checkpoint_dir: "results/sft_dolci_instruct_megatron_30b"
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B-Base"
+  tokenizer:
+    name: Qwen/Qwen3-30B-A3B-Base
+  train_global_batch_size: 512
+  train_micro_batch_size: 2
+  max_total_sequence_length: 16384
+
+  megatron_cfg:
+    activation_checkpointing: true
+
+data:
+  train:
+    dataset_name: Dolci-Instruct-SFT
+    processor: sft_processor
+    split: train
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: null
+
+logger:
+  wandb:
+    project: "sft-dolci-instruct-megatron"
+    name: "qwen30b-a3b-dolci-sft"

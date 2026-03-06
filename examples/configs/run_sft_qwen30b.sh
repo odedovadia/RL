@@ -1,7 +1,15 @@
 #!/bin/bash
 # nohup docker exec -it nemo_rl_dev bash
 
-export STEP=1855
+# export STEP=1855
+export STEP=3965
+
+# ---- Dataset config (switch between experiments) ----
+# SFT_CONFIG="examples/configs/sft_openmathinstruct2_megatron_30b.yaml"
+SFT_CONFIG="examples/configs/sft_dolci_instruct_megatron_30b.yaml"
+
+# Derive a short base name from the config filename (e.g. "sft_dolci_instruct_megatron_30b")
+SFT_CONFIG_NAME="$(basename "${SFT_CONFIG}" .yaml)"
 
 # Grid: freeze_moe_router:moe_router_topk
 CONFIGS=("false:8" "false:16" "true:8")
@@ -13,23 +21,22 @@ S3_BUCKET="s3://clm-research/models/moe_ablation"
 TOTAL_EXPS=$(( ${#CONFIGS[@]} * ${#LEARNING_RATES[@]} ))
 EXP_NUM=0
 
-for CONFIG in "${CONFIGS[@]}"; do
-    FREEZE_MOE_ROUTER="${CONFIG%%:*}"
-    MOE_ROUTER_TOPK="${CONFIG##*:}"
-
+for LR in "${LEARNING_RATES[@]}"; do
     echo ""
     echo "########################################################"
-    echo "# Config: freeze=${FREEZE_MOE_ROUTER} topk=${MOE_ROUTER_TOPK}"
+    echo "# Learning rate: ${LR}"
     echo "########################################################"
 
-    for LR in "${LEARNING_RATES[@]}"; do
+    for CONFIG in "${CONFIGS[@]}"; do
+        FREEZE_MOE_ROUTER="${CONFIG%%:*}"
+        MOE_ROUTER_TOPK="${CONFIG##*:}"
         EXP_NUM=$((EXP_NUM + 1))
         set -a
         source .env
         set +a
 
         if [ "$FREEZE_MOE_ROUTER" = "true" ]; then
-            export MODEL_NAME=sft_openmathinstruct2_megatron_30b_freeze_router
+            export MODEL_NAME=${SFT_CONFIG_NAME}_freeze_router
             export MOE_ROUTER_LOAD_BALANCING_TYPE="none"
             export MOE_ROUTER_BIAS_UPDATE_RATE=0.0
             export MOE_AUX_LOSS_COEFF=0.0
@@ -37,13 +44,22 @@ for CONFIG in "${CONFIGS[@]}"; do
             export MOE_ROUTER_LOAD_BALANCING_TYPE="aux_loss"
             export MOE_ROUTER_BIAS_UPDATE_RATE=0.001
             export MOE_AUX_LOSS_COEFF=0.0000001 # 1e-7
-            export MODEL_NAME=sft_openmathinstruct2_megatron_30b_active_router
+            export MODEL_NAME=${SFT_CONFIG_NAME}_active_router
         fi
 
         EXPERIMENT_DIR="topk${MOE_ROUTER_TOPK}_lr_${LR}"
         export MODEL_NAME=${MODEL_NAME}_${EXPERIMENT_DIR}
         LOG_DIR="log_history_full/${EXPERIMENT_DIR}"
         mkdir -p "${LOG_DIR}"
+
+        if [ -d "eval_results_full/${MODEL_NAME}" ]; then
+            echo "========================================================"
+            echo "Experiment ${EXP_NUM}/${TOTAL_EXPS}: ${MODEL_NAME}"
+            echo "Skipping: eval results already exist at eval_results_full/${MODEL_NAME}"
+            echo "========================================================"
+            echo ""
+            continue
+        fi
 
         echo "========================================================"
         echo "Experiment ${EXP_NUM}/${TOTAL_EXPS}: ${MODEL_NAME}"
@@ -59,7 +75,7 @@ for CONFIG in "${CONFIGS[@]}"; do
 
         echo "[$(date)] Training ${MODEL_NAME}..."
         NRL_FORCE_REBUILD_VENVS=true uv run python examples/run_sft.py \
-           --config examples/configs/sft_openmathinstruct2_megatron_30b.yaml \
+           --config ${SFT_CONFIG} \
            policy.megatron_cfg.freeze_moe_router=${FREEZE_MOE_ROUTER} \
            policy.megatron_cfg.moe_router_load_balancing_type=${MOE_ROUTER_LOAD_BALANCING_TYPE} \
            policy.megatron_cfg.moe_router_bias_update_rate=${MOE_ROUTER_BIAS_UPDATE_RATE} \
@@ -74,7 +90,7 @@ for CONFIG in "${CONFIGS[@]}"; do
 
         echo "[$(date)] Converting checkpoint to HF format..."
         NRL_FORCE_REBUILD_VENVS=true uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
-            --config=examples/configs/sft_openmathinstruct2_megatron_30b.yaml \
+            --config=${SFT_CONFIG} \
             --megatron-ckpt-path results/${MODEL_NAME}/step_${STEP}/policy/weights/iter_0000000 \
             --hf-ckpt-path results/${MODEL_NAME}/step_${STEP}/hf \
             > "${LOG_DIR}/convert.log" 2>&1

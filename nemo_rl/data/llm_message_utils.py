@@ -464,9 +464,17 @@ def get_formatted_message_log(
     """
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
+    # Sanitize message dicts for Jinja chat templates: coerce content=None to
+    # "" (templates access message.content unconditionally) and strip other
+    # None-valued keys that may leak from Arrow-serialized dataset schemas
+    # (e.g. function_calls/functions fields from Dolci-Instruct-SFT).
     message_log_strs: list[dict[str, str]] = cast(
-        list[dict[str, str]], message_log
-    )  # we just use the str:str parts here
+        list[dict[str, str]],
+        [
+            {**{k: v for k, v in m.items() if v is not None}, "content": m.get("content") or ""}
+            for m in message_log
+        ],
+    )
 
     multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
 
